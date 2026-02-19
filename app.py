@@ -709,6 +709,68 @@ def yf_fetch_short_interest(symbol):
     return result
 
 
+# ─── Currency conversion helpers ─────────────────────────────────────────────
+
+def yf_get_currencies(symbol):
+    """
+    Return (financial_currency, trading_currency) for a ticker from yfinance.
+    financial_currency = the currency the company reports in (e.g. 'CNY' for BABA)
+    trading_currency   = the currency the stock trades in (e.g. 'USD' for BABA on NYSE)
+    Returns (None, None) on failure.
+    """
+    try:
+        tk = yf.Ticker(symbol)
+        info = tk.info or {}
+        fin_ccy   = info.get('financialCurrency')   # reporting currency
+        trade_ccy = info.get('currency')             # trading / quote currency
+        return fin_ccy, trade_ccy
+    except Exception:
+        return None, None
+
+
+def yf_fetch_fx_rate(from_ccy, to_ccy):
+    """
+    Fetch the current exchange rate from `from_ccy` to `to_ccy` via yfinance.
+    E.g. yf_fetch_fx_rate('CNY', 'USD') returns ~0.137 (1 CNY = 0.137 USD).
+    Returns None on failure.
+    """
+    if not from_ccy or not to_ccy:
+        return None
+    if from_ccy.upper() == to_ccy.upper():
+        return 1.0
+    try:
+        pair = f'{from_ccy.upper()}{to_ccy.upper()}=X'
+        tk = yf.Ticker(pair)
+        # fast_info.last_price is the quickest way to get the rate
+        rate = tk.fast_info.get('lastPrice') if hasattr(tk.fast_info, 'get') else None
+        if rate is None:
+            # Fallback: try history
+            hist = tk.history(period='1d')
+            if hist is not None and not hist.empty:
+                rate = float(hist['Close'].iloc[-1])
+        return float(rate) if rate else None
+    except Exception:
+        return None
+
+
+def convert_estimates_currency(estimates, fx_rate):
+    """
+    Apply an FX rate to all monetary fields in the estimates dict (in-place).
+    EPS fields are per-share monetary values; revenue fields are in millions.
+    Both need the same multiplier.
+    """
+    MONEY_KEYS_FY = [
+        'eps_avg', 'eps_high', 'eps_low',
+        'revenue_avg_millions', 'revenue_high_millions', 'revenue_low_millions',
+    ]
+    for fy_key in ('fy1', 'fy2'):
+        fy = estimates.get(fy_key, {})
+        for k in MONEY_KEYS_FY:
+            val = fy.get(k)
+            if val is not None:
+                fy[k] = round(val * fx_rate, 4 if 'eps' in k else 2)
+
+
 # ─── Master payload builder ──────────────────────────────────────────────────
 
 def build_payload(symbol):
@@ -806,6 +868,27 @@ def build_payload(symbol):
                 'Forward estimates unavailable — Finnhub requires Premium and '
                 'Yahoo Finance did not return data for this ticker.'
             )
+
+    # 5b — Currency conversion: if reporting currency ≠ trading currency,
+    #       convert forward estimates so they match the stock's quote currency.
+    #       E.g. BABA reports in CNY but trades in USD on NYSE.
+    has_estimates = (
+        estimates['fy1']['eps_avg'] is not None
+        or estimates['fy1']['revenue_avg_millions'] is not None
+    )
+    fx_converted = False
+    if has_estimates:
+        fin_ccy, trade_ccy = yf_get_currencies(symbol)
+        if fin_ccy and trade_ccy and fin_ccy.upper() != trade_ccy.upper():
+            fx_rate = yf_fetch_fx_rate(fin_ccy, trade_ccy)
+            if fx_rate and fx_rate != 1.0:
+                convert_estimates_currency(estimates, fx_rate)
+                fx_note = (
+                    f'Estimates converted from {fin_ccy} to {trade_ccy} '
+                    f'at {fx_rate:.4f} {trade_ccy}/{fin_ccy}.'
+                )
+                estimates_note = f'{estimates_note} {fx_note}' if estimates_note else fx_note
+                fx_converted = True
 
     def est_block(fy_key):
         e = estimates[fy_key]

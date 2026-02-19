@@ -574,10 +574,14 @@ function renderFinancials(fin, val) {
     </tr>`
   ).join('');
 
-  // Estimates note
+  // Estimates note — info style for source/conversion notes, warn style for errors
   if (fin.estimates_note) {
-    $('est-note').textContent = '⚠ ' + fin.estimates_note;
-    $('est-note').style.display = 'block';
+    const note = fin.estimates_note;
+    const isWarning = note.toLowerCase().includes('unavailable');
+    const noteEl = $('est-note');
+    noteEl.className = isWarning ? 'warn-note' : 'info-note';
+    noteEl.textContent = (isWarning ? '⚠ ' : 'ℹ ') + note;
+    noteEl.style.display = 'block';
   } else {
     $('est-note').style.display = 'none';
   }
