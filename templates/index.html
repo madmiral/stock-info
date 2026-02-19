@@ -308,12 +308,12 @@
 <div id="welcome">
   <div class="big-icon">&#128200;</div>
   <p>Enter a stock ticker above to see detailed financials, valuation, and more.</p>
-  <small>Powered by Finnhub &bull; US equities &bull; Data delayed 15 min</small>
+  <small>Powered by Finnhub + Yahoo Finance &bull; US equities &bull; Data delayed 15 min</small>
 </div>
 
 <div id="loading">
   <div class="spinner"></div>
-  <p>Fetching data from Finnhub&hellip;</p>
+  <p>Fetching data&hellip;</p>
 </div>
 
 <div id="dashboard">
@@ -632,7 +632,7 @@ function renderShareholders(holders, ownershipNote) {
 
   if (!holders || holders.length === 0) {
     $('sh-tbody').innerHTML = `<tr><td colspan="6" class="na" style="text-align:center;padding:20px">
-      ${ownershipNote ? 'Institutional ownership requires a Finnhub Premium plan.' : 'No institutional holder data available.'}
+      ${ownershipNote ? ownershipNote : 'No institutional holder data available.'}
     </td></tr>`;
     return;
   }

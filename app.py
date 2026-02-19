@@ -8,6 +8,7 @@ import time
 import json
 import datetime
 import traceback
+import yfinance as yf
 
 app = Flask(__name__)
 CORS(app)
@@ -526,6 +527,136 @@ def fetch_profile(client, symbol):
     return result, errors
 
 
+# ─── yfinance secondary data source ──────────────────────────────────────────
+# Used ONLY for: (1) forward estimates  (2) top institutional shareholders.
+# Finnhub remains the primary source for everything else.
+
+def yf_fetch_estimates(symbol):
+    """
+    Forward EPS/revenue estimates for FY1 and FY2 from yfinance.
+    Returns same structure as fetch_estimates() for easy merging.
+    """
+    result = {
+        'fy1': {
+            'year': None, 'period': None,
+            'eps_avg': None, 'eps_high': None, 'eps_low': None, 'eps_analysts': None,
+            'revenue_avg_millions': None, 'revenue_high_millions': None,
+            'revenue_low_millions': None, 'revenue_analysts': None,
+        },
+        'fy2': {
+            'year': None, 'period': None,
+            'eps_avg': None, 'eps_high': None, 'eps_low': None, 'eps_analysts': None,
+            'revenue_avg_millions': None, 'revenue_high_millions': None,
+            'revenue_low_millions': None, 'revenue_analysts': None,
+        },
+        'premium_required': False,
+        'source': 'yfinance',
+    }
+    try:
+        tk = yf.Ticker(symbol)
+
+        # ── Earnings estimates (EPS) ──
+        try:
+            ee = tk.earnings_estimate
+            if ee is not None and not ee.empty:
+                # Columns are period labels like '+1y', '+2y' or fiscal year strings
+                cols = list(ee.columns)
+                for i, fy_key in enumerate(['fy1', 'fy2']):
+                    if i >= len(cols):
+                        break
+                    col = cols[i]
+                    result[fy_key]['eps_avg']      = _yf_val(ee, 'avg', col)
+                    result[fy_key]['eps_high']     = _yf_val(ee, 'high', col)
+                    result[fy_key]['eps_low']      = _yf_val(ee, 'low', col)
+                    result[fy_key]['eps_analysts'] = _yf_val(ee, 'numberOfAnalysts', col)
+                    # Try to parse year from column label
+                    result[fy_key]['year'] = _parse_fy_year(col)
+        except Exception:
+            pass
+
+        # ── Revenue estimates ──
+        try:
+            re_ = tk.revenue_estimate
+            if re_ is not None and not re_.empty:
+                cols = list(re_.columns)
+                for i, fy_key in enumerate(['fy1', 'fy2']):
+                    if i >= len(cols):
+                        break
+                    col = cols[i]
+                    avg_val  = _yf_val(re_, 'avg', col)
+                    high_val = _yf_val(re_, 'high', col)
+                    low_val  = _yf_val(re_, 'low', col)
+                    result[fy_key]['revenue_avg_millions']  = to_millions(avg_val)
+                    result[fy_key]['revenue_high_millions'] = to_millions(high_val)
+                    result[fy_key]['revenue_low_millions']  = to_millions(low_val)
+                    result[fy_key]['revenue_analysts']      = _yf_val(re_, 'numberOfAnalysts', col)
+                    if result[fy_key]['year'] is None:
+                        result[fy_key]['year'] = _parse_fy_year(col)
+        except Exception:
+            pass
+
+    except Exception:
+        # yfinance rate-limited or unavailable — silent fallback
+        pass
+
+    return result
+
+
+def yf_fetch_shareholders(symbol):
+    """
+    Top institutional holders from yfinance.
+    Returns list of holder dicts compatible with fetch_ownership() output.
+    """
+    holders = []
+    try:
+        tk = yf.Ticker(symbol)
+        ih = tk.institutional_holders
+        if ih is not None and not ih.empty:
+            for _, row in ih.head(10).iterrows():
+                shares = row.get('Shares')
+                pct    = row.get('% Out')
+                date_r = row.get('Date Reported')
+                holders.append({
+                    'name':          str(row.get('Holder', '')),
+                    'shares':        int(shares) if shares is not None else None,
+                    'change':        None,  # yfinance doesn't provide change
+                    'pct_held':      round(float(pct) * 100, 4) if pct is not None else None,
+                    'value_millions': to_millions(row.get('Value')),
+                    'date_reported': str(date_r.date()) if hasattr(date_r, 'date') else str(date_r)[:10] if date_r else '',
+                })
+    except Exception:
+        # yfinance rate-limited or unavailable — silent fallback
+        pass
+    return holders
+
+
+def _yf_val(df, row_label, col):
+    """Safely extract a value from a yfinance DataFrame by row label and column."""
+    try:
+        val = df.loc[row_label, col]
+        if val is not None and str(val) not in ('nan', 'NaN', ''):
+            return float(val)
+    except Exception:
+        pass
+    return None
+
+
+def _parse_fy_year(col_label):
+    """Try to extract a fiscal year from a yfinance column label like '+1y' or '2025'."""
+    try:
+        s = str(col_label).strip()
+        if s.startswith('+') and s.endswith('y'):
+            offset = int(s[1:-1])
+            return datetime.datetime.utcnow().year + offset
+        # Maybe it's just a year
+        y = int(s)
+        if 2000 <= y <= 2100:
+            return y
+    except Exception:
+        pass
+    return None
+
+
 # ─── Master payload builder ──────────────────────────────────────────────────
 
 def build_payload(symbol):
@@ -597,13 +728,32 @@ def build_payload(symbol):
         'fcf_millions':                  reported['fcf_millions'],
     }
 
-    # 5 — Forward estimates (premium; degrades to N/A)
+    # 5 — Forward estimates (Finnhub primary, yfinance secondary)
     estimates, errs = fetch_estimates(client, symbol)
     all_errors.extend(errs)
-    estimates_note = (
-        'EPS and revenue estimates require a Finnhub Premium plan. '
-        'Upgrade at finnhub.io to unlock forward estimates.'
-    ) if estimates['premium_required'] else None
+    estimates_note = None
+    estimates_source = 'Finnhub'
+
+    # If Finnhub estimates are empty or premium-gated, fall back to yfinance
+    finnhub_est_empty = (
+        estimates['premium_required']
+        or (estimates['fy1']['eps_avg'] is None and estimates['fy1']['revenue_avg_millions'] is None)
+    )
+    if finnhub_est_empty:
+        yf_est = yf_fetch_estimates(symbol)
+        yf_has_data = (
+            yf_est['fy1']['eps_avg'] is not None
+            or yf_est['fy1']['revenue_avg_millions'] is not None
+        )
+        if yf_has_data:
+            estimates = yf_est
+            estimates_source = 'yfinance'
+            estimates_note = 'Forward estimates sourced from Yahoo Finance (yfinance).'
+        elif estimates['premium_required']:
+            estimates_note = (
+                'Forward estimates unavailable — Finnhub requires Premium and '
+                'Yahoo Finance did not return data for this ticker.'
+            )
 
     def est_block(fy_key):
         e = estimates[fy_key]
@@ -646,12 +796,22 @@ def build_payload(symbol):
     next_fy  = est_block('fy1')
     next_fy2 = est_block('fy2')
 
-    # 6 — Institutional ownership (premium; degrades)
+    # 6 — Institutional ownership (Finnhub primary, yfinance secondary)
     shareholders, ownership_premium, errs = fetch_ownership(client, symbol)
     all_errors.extend(errs)
-    ownership_note = (
-        'Institutional ownership data requires a Finnhub Premium plan.'
-    ) if ownership_premium else None
+    ownership_note = None
+
+    # If Finnhub ownership is empty or premium-gated, fall back to yfinance
+    if not shareholders or ownership_premium:
+        yf_holders = yf_fetch_shareholders(symbol)
+        if yf_holders:
+            shareholders = yf_holders
+            ownership_note = 'Institutional holders sourced from Yahoo Finance (yfinance).'
+        elif ownership_premium:
+            ownership_note = (
+                'Institutional ownership unavailable — Finnhub requires Premium and '
+                'Yahoo Finance did not return data for this ticker.'
+            )
 
     # 7 — Insider transactions (free)
     insider_txs, errs = fetch_insider_transactions(client, symbol)

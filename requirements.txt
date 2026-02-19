@@ -4,3 +4,4 @@ flask-cors==4.0.1
 gunicorn==22.0.0
 python-dotenv
 pandas
+yfinance
