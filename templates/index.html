@@ -604,9 +604,21 @@ function renderValuation(val) {
 }
 
 function renderShortInterest(si) {
+  const hasData = si.short_percent_of_float != null || si.shares_short != null || si.short_ratio != null || si.float_shares != null;
   if (si.note) {
-    $('short-note').textContent = '⚠ ' + si.note;
-    $('short-note').style.display = 'block';
+    const noteEl = $('short-note');
+    if (hasData) {
+      // Source attribution — use info style
+      noteEl.className = 'info-note';
+      noteEl.textContent = 'ℹ ' + si.note;
+    } else {
+      // No data warning
+      noteEl.className = 'warn-note';
+      noteEl.textContent = '⚠ ' + si.note;
+    }
+    noteEl.style.display = 'block';
+  } else {
+    $('short-note').style.display = 'none';
   }
   const items = [
     { label: 'Short % of Float',  value: si.short_percent_of_float != null ? fmtNum(si.short_percent_of_float, 2) + '%' : NA },

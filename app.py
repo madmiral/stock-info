@@ -528,13 +528,51 @@ def fetch_profile(client, symbol):
 
 
 # ─── yfinance secondary data source ──────────────────────────────────────────
-# Used ONLY for: (1) forward estimates  (2) top institutional shareholders.
-# Finnhub remains the primary source for everything else.
+# Used ONLY for: (1) forward estimates  (2) top institutional shareholders
+# (3) short interest.  Finnhub remains the primary source for everything else.
+
+def _yf_safe(df, period, col):
+    """Safely extract a numeric value from a yfinance DataFrame.
+
+    yfinance DataFrames use *periods* as the INDEX (e.g. '0y', '+1y')
+    and *metric names* as COLUMNS (e.g. 'avg', 'high', 'numberOfAnalysts').
+    """
+    try:
+        val = df.loc[period, col]
+        if val is not None and str(val) not in ('nan', 'NaN', ''):
+            return float(val)
+    except Exception:
+        pass
+    return None
+
+
+def _parse_fy_year(period_label):
+    """Convert a yfinance period label to a calendar year.
+
+    Labels look like '0y' (current FY), '+1y' (next FY), '0q', '+1q', etc.
+    """
+    try:
+        s = str(period_label).strip()
+        if s.endswith('y'):
+            offset = int(s.replace('+', '').replace('y', ''))
+            return datetime.datetime.utcnow().year + offset
+        y = int(s)
+        if 2000 <= y <= 2100:
+            return y
+    except Exception:
+        pass
+    return None
+
 
 def yf_fetch_estimates(symbol):
     """
     Forward EPS/revenue estimates for FY1 and FY2 from yfinance.
     Returns same structure as fetch_estimates() for easy merging.
+
+    yfinance earnings_estimate / revenue_estimate DataFrames:
+        Index  : ['0q', '+1q', '0y', '+1y']   (periods)
+        Columns: ['numberOfAnalysts', 'avg', 'low', 'high', ...]
+    We want the '0y' (current FY → fy1) and '+1y' (next FY → fy2) rows.
     """
     result = {
         'fy1': {
@@ -552,6 +590,10 @@ def yf_fetch_estimates(symbol):
         'premium_required': False,
         'source': 'yfinance',
     }
+
+    # Map: fy_key → yfinance period index label
+    PERIOD_MAP = [('fy1', '0y'), ('fy2', '+1y')]
+
     try:
         tk = yf.Ticker(symbol)
 
@@ -559,18 +601,14 @@ def yf_fetch_estimates(symbol):
         try:
             ee = tk.earnings_estimate
             if ee is not None and not ee.empty:
-                # Columns are period labels like '+1y', '+2y' or fiscal year strings
-                cols = list(ee.columns)
-                for i, fy_key in enumerate(['fy1', 'fy2']):
-                    if i >= len(cols):
-                        break
-                    col = cols[i]
-                    result[fy_key]['eps_avg']      = _yf_val(ee, 'avg', col)
-                    result[fy_key]['eps_high']     = _yf_val(ee, 'high', col)
-                    result[fy_key]['eps_low']      = _yf_val(ee, 'low', col)
-                    result[fy_key]['eps_analysts'] = _yf_val(ee, 'numberOfAnalysts', col)
-                    # Try to parse year from column label
-                    result[fy_key]['year'] = _parse_fy_year(col)
+                for fy_key, period in PERIOD_MAP:
+                    if period in ee.index:
+                        result[fy_key]['eps_avg']      = _yf_safe(ee, period, 'avg')
+                        result[fy_key]['eps_high']     = _yf_safe(ee, period, 'high')
+                        result[fy_key]['eps_low']      = _yf_safe(ee, period, 'low')
+                        result[fy_key]['eps_analysts'] = _yf_safe(ee, period, 'numberOfAnalysts')
+                        result[fy_key]['year']         = _parse_fy_year(period)
+                        result[fy_key]['period']       = period
         except Exception:
             pass
 
@@ -578,20 +616,18 @@ def yf_fetch_estimates(symbol):
         try:
             re_ = tk.revenue_estimate
             if re_ is not None and not re_.empty:
-                cols = list(re_.columns)
-                for i, fy_key in enumerate(['fy1', 'fy2']):
-                    if i >= len(cols):
-                        break
-                    col = cols[i]
-                    avg_val  = _yf_val(re_, 'avg', col)
-                    high_val = _yf_val(re_, 'high', col)
-                    low_val  = _yf_val(re_, 'low', col)
-                    result[fy_key]['revenue_avg_millions']  = to_millions(avg_val)
-                    result[fy_key]['revenue_high_millions'] = to_millions(high_val)
-                    result[fy_key]['revenue_low_millions']  = to_millions(low_val)
-                    result[fy_key]['revenue_analysts']      = _yf_val(re_, 'numberOfAnalysts', col)
-                    if result[fy_key]['year'] is None:
-                        result[fy_key]['year'] = _parse_fy_year(col)
+                for fy_key, period in PERIOD_MAP:
+                    if period in re_.index:
+                        avg_val  = _yf_safe(re_, period, 'avg')
+                        high_val = _yf_safe(re_, period, 'high')
+                        low_val  = _yf_safe(re_, period, 'low')
+                        result[fy_key]['revenue_avg_millions']  = to_millions(avg_val)
+                        result[fy_key]['revenue_high_millions'] = to_millions(high_val)
+                        result[fy_key]['revenue_low_millions']  = to_millions(low_val)
+                        result[fy_key]['revenue_analysts']      = _yf_safe(re_, period, 'numberOfAnalysts')
+                        if result[fy_key]['year'] is None:
+                            result[fy_key]['year']   = _parse_fy_year(period)
+                            result[fy_key]['period'] = period
         except Exception:
             pass
 
@@ -630,31 +666,47 @@ def yf_fetch_shareholders(symbol):
     return holders
 
 
-def _yf_val(df, row_label, col):
-    """Safely extract a value from a yfinance DataFrame by row label and column."""
+def yf_fetch_short_interest(symbol):
+    """
+    Short interest data from yfinance (via tk.info / defaultKeyStatistics).
+    Returns a dict compatible with the short_interest block in the payload.
+    """
+    result = {
+        'short_percent_of_float': None,
+        'shares_short': None,
+        'short_ratio': None,
+        'float_shares': None,
+        'note': None,
+    }
     try:
-        val = df.loc[row_label, col]
-        if val is not None and str(val) not in ('nan', 'NaN', ''):
-            return float(val)
-    except Exception:
-        pass
-    return None
+        tk = yf.Ticker(symbol)
+        info = tk.info or {}
 
+        spf = info.get('shortPercentOfFloat')
+        if spf is not None:
+            result['short_percent_of_float'] = round(float(spf) * 100, 2)
 
-def _parse_fy_year(col_label):
-    """Try to extract a fiscal year from a yfinance column label like '+1y' or '2025'."""
-    try:
-        s = str(col_label).strip()
-        if s.startswith('+') and s.endswith('y'):
-            offset = int(s[1:-1])
-            return datetime.datetime.utcnow().year + offset
-        # Maybe it's just a year
-        y = int(s)
-        if 2000 <= y <= 2100:
-            return y
+        ss = info.get('sharesShort')
+        if ss is not None:
+            result['shares_short'] = int(ss)
+
+        sr = info.get('shortRatio')
+        if sr is not None:
+            result['short_ratio'] = round(float(sr), 2)
+
+        fs = info.get('floatShares')
+        if fs is not None:
+            result['float_shares'] = int(fs)
+
+        # If we got at least one field, note the source
+        has_data = any(result[k] is not None for k in ('short_percent_of_float', 'shares_short', 'short_ratio', 'float_shares'))
+        if has_data:
+            result['note'] = 'Short interest sourced from Yahoo Finance (yfinance).'
+        else:
+            result['note'] = 'Short interest data not available for this ticker.'
     except Exception:
-        pass
-    return None
+        result['note'] = 'Short interest data temporarily unavailable (Yahoo Finance rate limit). Try again shortly.'
+    return result
 
 
 # ─── Master payload builder ──────────────────────────────────────────────────
@@ -825,14 +877,8 @@ def build_payload(symbol):
     ev_ebitda    = bf['ev_ebitda']   # now populated from series_annual['evEbitda']
     ev_revenue   = bf['ev_revenue']  # now populated from series_annual['evRevenue']
 
-    # Short interest — NOT available on Finnhub; surface a clear note
-    short_interest = {
-        'short_percent_of_float': None,
-        'shares_short': None,
-        'short_ratio': None,
-        'float_shares': None,
-        'note': 'Short interest data is not available via the Finnhub API on any tier. Use FINRA or a dedicated short-data provider.',
-    }
+    # 9 — Short interest (yfinance — not available on Finnhub)
+    short_interest = yf_fetch_short_interest(symbol)
 
     payload = {
         'ticker':               symbol,
